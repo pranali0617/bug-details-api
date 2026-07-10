@@ -1,0 +1,7 @@
+{
+  "mailshell_username": "admin",
+  "mailshell_password": "thas8um7",
+  "bugzilla_token": "9rmBoZGsxQnaCP3C6k2PHHOHdANfaCtszdZr5UCf",
+  "bz_rest_url": "https://dev.mailshell.net/corp/bugzilla/rest.cgi/bug",
+  "default_bug_id": "9340"
+}
