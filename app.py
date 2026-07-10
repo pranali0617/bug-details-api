@@ -45,7 +45,7 @@ def get_fetcher() -> BugzillaFetcher:
     return BugzillaFetcher(config)
 
 
-@app.get("/get_bug_details.html")
+@app.get("/get_bug_details")
 def get_bug_details(
     bug_id: str = Query(..., description="Bugzilla bug id to fetch, e.g. 9340"),
 ):
