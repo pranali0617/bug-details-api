@@ -107,10 +107,10 @@ class BugzillaFetcher:
             return history_root.get(str(bug_id), {}).get("history", [])
         return []
 
-    def _get_latest_comment(self, bug_id: str) -> Dict[str, Any]:
+    def _get_comments(self, bug_id: str) -> List[Dict[str, Any]]:
         comments = self._fetch_comments(bug_id)
         if not comments:
-            return {}
+            return []
 
         def comment_sort_key(comment: Dict[str, Any]) -> tuple:
             return (
@@ -120,7 +120,7 @@ class BugzillaFetcher:
                 comment.get("id", -1),
             )
 
-        return max(comments, key=comment_sort_key)
+        return sorted(comments, key=comment_sort_key)
 
     def _clean_csv_text(self, value: Any) -> str:
         """Convert multiline markdown-ish text into a single CSV-friendly line."""
@@ -183,7 +183,7 @@ class BugzillaFetcher:
         """
         Build a recursive bug node for a bug and all of its dependencies.
 
-        Each node includes the selected bug fields, the latest comment, and
+        Each node includes the selected bug fields, all comments, and
         nested dependency bugs in the same shape.
         """
         bug_id = str(bug_id)
@@ -203,7 +203,7 @@ class BugzillaFetcher:
         visited.add(bug_id)
         bug = self._fetch_bug_record(bug_id)
         dependency_ids = [str(dep_id) for dep_id in (bug.get("depends_on") or [])]
-        latest_comment = self._get_latest_comment(bug_id)
+        comments = self._get_comments(bug_id)
         depends_on_bugs = [
             self._build_bug_node(dep_id, visited.copy())
             for dep_id in dependency_ids
@@ -212,7 +212,7 @@ class BugzillaFetcher:
         node = {
             "bug_id": bug.get("id", bug_id),
             "bug": self._select_bug_fields(bug),
-            "last_comment": latest_comment,
+            "comments": comments,
             "depends_on_ids": dependency_ids,
             "depends_on_bugs": depends_on_bugs,
         }
@@ -221,15 +221,15 @@ class BugzillaFetcher:
 
     def fetch_bug_details(self, bug_id: str) -> Dict[str, Any]:
         """
-        Fetch the core bug fields plus the latest comment and recursive dependency data.
+        Fetch the core bug fields plus all comments and recursive dependency data.
         """
         bug = self._fetch_bug_record(bug_id)
-        latest_comment = self._get_latest_comment(bug_id)
+        comments = self._get_comments(bug_id)
         dependency_tree = self._build_bug_node(bug_id)
 
         return {
             "bug": bug,
-            "latest_comment": latest_comment,
+            "comments": comments,
             "dependency_tree": dependency_tree,
         }
 
@@ -244,7 +244,7 @@ class BugzillaFetcher:
                 "api_base_url": self.bz_rest_url,
             },
             "bug": self._select_bug_fields(bug),
-            "latest_comment": details["latest_comment"],
+            "comments": details["comments"],
             "depends_on_bugs": details["dependency_tree"].get("depends_on_bugs", []),
         }
 
@@ -271,7 +271,7 @@ class BugzillaFetcher:
             }]
 
         bug = node.get("bug", {})
-        latest_comment = node.get("last_comment", {})
+        comments = node.get("comments", [])
         current_bug_id = str(node.get("bug_id", bug.get("id", "")))
         current_path = path + [current_bug_id]
 
@@ -299,9 +299,13 @@ class BugzillaFetcher:
             "deadline": bug.get("deadline", ""),
             "whiteboard": self._clean_csv_text(bug.get("whiteboard", "")),
             "depends_on_ids": ", ".join(node.get("depends_on_ids", [])),
-            "latest_comment_time": latest_comment.get("creation_time") or latest_comment.get("time", ""),
-            "latest_comment_creator": latest_comment.get("creator", ""),
-            "latest_comment_text": self._clean_csv_text(latest_comment.get("text", "")),
+            "comment_count": len(comments),
+            "comments_text": " || ".join(
+                f"[{comment.get('creator', '')} @ "
+                f"{comment.get('creation_time') or comment.get('time', '')}] "
+                f"{self._clean_csv_text(comment.get('text', ''))}"
+                for comment in comments
+            ),
         }
 
         rows = [row]
