@@ -1,5 +1,4 @@
 import argparse
-import copy
 import csv
 import json
 import logging
@@ -48,8 +47,6 @@ class BugzillaFetcher:
             "bz_rest_url",
             "https://dev.mailshell.net/corp/bugzilla/rest/bug",
         ).rstrip("/")
-        self._bug_cache: Dict[str, Dict[str, Any]] = {}
-        self._node_cache: Dict[str, Dict[str, Any]] = {}
 
     def _request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         request_params = dict(params or {})
@@ -68,20 +65,15 @@ class BugzillaFetcher:
         return response.json()
 
     def _fetch_bug_record(self, bug_id: str) -> Dict[str, Any]:
-        """Fetch and cache the raw bug record for a single bug id."""
+        """Fetch the raw bug record for a single bug id."""
         bug_id = str(bug_id)
-        if bug_id in self._bug_cache:
-            return self._bug_cache[bug_id]
-
         bug_url = f"{self.bz_rest_url}/{bug_id}"
         payload = self._request(bug_url)
         bugs = payload.get("bugs", [])
         if not bugs:
             raise ValueError(f"No bug found for bug id {bug_id}")
 
-        bug = bugs[0]
-        self._bug_cache[bug_id] = bug
-        return bug
+        return bugs[0]
 
     def _fetch_comments(self, bug_id: str) -> List[Dict[str, Any]]:
         comments_payload = self._request(f"{self.bz_rest_url}/{bug_id}/comment")
@@ -189,9 +181,6 @@ class BugzillaFetcher:
         bug_id = str(bug_id)
         visited = set(visited or set())
 
-        if bug_id in self._node_cache:
-            return copy.deepcopy(self._node_cache[bug_id])
-
         if bug_id in visited:
             return {
                 "bug_id": bug_id,
@@ -216,7 +205,6 @@ class BugzillaFetcher:
             "depends_on_ids": dependency_ids,
             "depends_on_bugs": depends_on_bugs,
         }
-        self._node_cache[bug_id] = copy.deepcopy(node)
         return node
 
     def fetch_bug_details(self, bug_id: str) -> Dict[str, Any]:
