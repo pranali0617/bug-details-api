@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import csv
 import json
 import logging
@@ -8,6 +9,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
+
+# Caps simultaneous connections to Bugzilla so a bug with many dependencies
+# fans out in parallel batches instead of hammering the server unbounded.
+MAX_CONCURRENT_REQUESTS = 20
 
 
 def load_config(config_path: str = "config.json") -> Dict[str, Any]:
@@ -47,50 +52,59 @@ class BugzillaFetcher:
             "bz_rest_url",
             "https://dev.mailshell.net/corp/bugzilla/rest/bug",
         ).rstrip("/")
+        self._client = httpx.AsyncClient(
+            auth=(self.auth_user, self.auth_pass) if self.auth_user else None,
+            # pool timeout is kept separate (and generous) from the
+            # connect/read/write timeout: with many dependencies, requests
+            # routinely queue for a free connection rather than failing, and
+            # that queueing wait shouldn't be mistaken for a dead request.
+            timeout=httpx.Timeout(20, pool=60),
+            limits=httpx.Limits(
+                max_connections=MAX_CONCURRENT_REQUESTS,
+                max_keepalive_connections=MAX_CONCURRENT_REQUESTS,
+            ),
+        )
 
-    def _request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def _request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         request_params = dict(params or {})
         headers = {"Accept": "application/json"}
         if self.bugzilla_token:
             request_params["api_key"] = self.bugzilla_token
 
-        response = httpx.get(
-            url,
-            params=request_params,
-            headers=headers,
-            auth=(self.auth_user, self.auth_pass) if self.auth_user else None,
-            timeout=20,
-        )
+        response = await self._client.get(url, params=request_params, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def _fetch_bug_record(self, bug_id: str) -> Dict[str, Any]:
+    async def _fetch_bug_record(self, bug_id: str) -> Dict[str, Any]:
         """Fetch the raw bug record for a single bug id."""
         bug_id = str(bug_id)
         bug_url = f"{self.bz_rest_url}/{bug_id}"
-        payload = self._request(bug_url)
+        payload = await self._request(bug_url)
         bugs = payload.get("bugs", [])
         if not bugs:
             raise ValueError(f"No bug found for bug id {bug_id}")
 
         return bugs[0]
 
-    def _fetch_comments(self, bug_id: str) -> List[Dict[str, Any]]:
-        comments_payload = self._request(f"{self.bz_rest_url}/{bug_id}/comment")
+    async def _fetch_comments(self, bug_id: str) -> List[Dict[str, Any]]:
+        comments_payload = await self._request(f"{self.bz_rest_url}/{bug_id}/comment")
         comments_root = comments_payload.get("bugs", {})
         if isinstance(comments_root, dict):
             return comments_root.get(str(bug_id), {}).get("comments", [])
         return []
 
-    def _fetch_attachments(self, bug_id: str) -> List[Dict[str, Any]]:
-        attachments_payload = self._request(f"{self.bz_rest_url}/{bug_id}/attachment")
+    async def _fetch_attachments(self, bug_id: str) -> List[Dict[str, Any]]:
+        attachments_payload = await self._request(f"{self.bz_rest_url}/{bug_id}/attachment")
         attachments_root = attachments_payload.get("bugs", {})
         if isinstance(attachments_root, dict):
             return attachments_root.get(str(bug_id), [])
         return []
 
-    def _fetch_history(self, bug_id: str) -> List[Dict[str, Any]]:
-        history_payload = self._request(f"{self.bz_rest_url}/{bug_id}/history")
+    async def _fetch_history(self, bug_id: str) -> List[Dict[str, Any]]:
+        history_payload = await self._request(f"{self.bz_rest_url}/{bug_id}/history")
         history_root = history_payload.get("bugs", history_payload.get("history", []))
 
         if isinstance(history_root, list):
@@ -99,8 +113,8 @@ class BugzillaFetcher:
             return history_root.get(str(bug_id), {}).get("history", [])
         return []
 
-    def _get_comments(self, bug_id: str) -> List[Dict[str, Any]]:
-        comments = self._fetch_comments(bug_id)
+    async def _get_comments(self, bug_id: str) -> List[Dict[str, Any]]:
+        comments = await self._fetch_comments(bug_id)
         if not comments:
             return []
 
@@ -167,7 +181,7 @@ class BugzillaFetcher:
             "remaining_time": bug.get("remaining_time", 0),
         }
 
-    def _build_bug_node(
+    async def _build_bug_node(
         self,
         bug_id: str,
         visited: Optional[Set[str]] = None,
@@ -176,7 +190,9 @@ class BugzillaFetcher:
         Build a recursive bug node for a bug and all of its dependencies.
 
         Each node includes the selected bug fields, all comments, and
-        nested dependency bugs in the same shape.
+        nested dependency bugs in the same shape. Siblings (a bug's own
+        comments vs. its dependencies, and each dependency vs. the next)
+        are fetched concurrently rather than one request at a time.
         """
         bug_id = str(bug_id)
         visited = set(visited or set())
@@ -190,13 +206,19 @@ class BugzillaFetcher:
             }
 
         visited.add(bug_id)
-        bug = self._fetch_bug_record(bug_id)
+        bug, comments = await asyncio.gather(
+            self._fetch_bug_record(bug_id),
+            self._get_comments(bug_id),
+        )
         dependency_ids = [str(dep_id) for dep_id in (bug.get("depends_on") or [])]
-        comments = self._get_comments(bug_id)
-        depends_on_bugs = [
-            self._build_bug_node(dep_id, visited.copy())
-            for dep_id in dependency_ids
-        ]
+        depends_on_bugs = list(
+            await asyncio.gather(
+                *(
+                    self._build_bug_node(dep_id, visited.copy())
+                    for dep_id in dependency_ids
+                )
+            )
+        )
 
         node = {
             "bug_id": bug.get("id", bug_id),
@@ -207,17 +229,15 @@ class BugzillaFetcher:
         }
         return node
 
-    def fetch_bug_details(self, bug_id: str) -> Dict[str, Any]:
+    async def fetch_bug_details(self, bug_id: str) -> Dict[str, Any]:
         """
         Fetch the core bug fields plus all comments and recursive dependency data.
         """
-        bug = self._fetch_bug_record(bug_id)
-        comments = self._get_comments(bug_id)
-        dependency_tree = self._build_bug_node(bug_id)
+        dependency_tree = await self._build_bug_node(bug_id)
 
         return {
-            "bug": bug,
-            "comments": comments,
+            "bug": dependency_tree["bug"],
+            "comments": dependency_tree["comments"],
             "dependency_tree": dependency_tree,
         }
 
@@ -354,7 +374,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
+async def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -364,7 +384,10 @@ def main() -> int:
         raise SystemExit("Provide a bug id either as an argument or via BUG_ID/default_bug_id.")
 
     fetcher = BugzillaFetcher(config)
-    details = fetcher.fetch_bug_details(str(bug_id))
+    try:
+        details = await fetcher.fetch_bug_details(str(bug_id))
+    finally:
+        await fetcher.aclose()
     document = fetcher.build_output_document(str(bug_id), details)
 
     output_path = Path(args.output or f"bug_{bug_id}_details.json")
@@ -383,7 +406,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))
 
 
 # python3 get_bug_details.py --csv-output bug_details.csv

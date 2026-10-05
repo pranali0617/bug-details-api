@@ -46,12 +46,12 @@ def get_fetcher() -> BugzillaFetcher:
 
 
 @app.get("/get_bug_details")
-def get_bug_details(
+async def get_bug_details(
     bug_id: str = Query(..., description="Bugzilla bug id to fetch, e.g. 9340"),
 ):
     fetcher = get_fetcher()
     try:
-        details = fetcher.fetch_bug_details(bug_id)
+        details = await fetcher.fetch_bug_details(bug_id)
     except ValueError as exc:
         # e.g. "No bug found for bug id 9340"
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -68,3 +68,9 @@ def get_bug_details(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if get_fetcher.cache_info().currsize:
+        await get_fetcher().aclose()
